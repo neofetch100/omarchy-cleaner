@@ -3,7 +3,7 @@
 ## Project Overview
 
 Omarchy Cleaner is an interactive shell script that removes unwanted default
-applications and webapps from [Omarchy](https://github.com/basecamp/omarchy)
+applications and webapps from [Omarchy](https://github.com/omacom/omarchy)
 installations. It is a single self-contained Bash script meant to be run on a
 freshly installed Omarchy system — typically piped straight from GitHub:
 
@@ -15,7 +15,7 @@ It uses [`gum`](https://github.com/charmbracelet/gum) (which ships with Omarchy)
 for the whole TUI: the ASCII banner, the fuzzy multi-select list, spinners,
 confirmation dialogs, and the success/partial/failure "hero" summary. There is
 no compiled binary and no dependencies beyond what Omarchy already installs
-(`gum`, `pacman`, and Omarchy's own `omarchy-webapp-remove` helper).
+(`gum`, `pacman`, and Omarchy's `omarchy-webapp-remove` / `omarchy-tui-remove` helpers).
 
 ## Code Architecture
 
@@ -27,13 +27,16 @@ Config block            VERSION; BINDINGS_FILE auto-detected (.lua preferred,
 DEFAULT_APPS[]          pacman packages offered for removal (active + a large
                         commented catalogue of every other Omarchy default).
 DEFAULT_WEBAPPS[]       Omarchy webapps offered for removal (by display name).
+DEFAULT_TUIS[]          Known TUI desktop launchers (Docker and Disk Usage).
 DEFAULT_NPM_CLIS[]      Omarchy npm CLI tools (codex, gemini, opencode, ...),
-                        installed as pnpm-dlx stubs in ~/.local/bin (not pacman).
+                        installed as mise/npx/pnpm wrappers in ~/.local/bin.
+                        Complete known templates are checked, or Hermes' upstream
+                        read-only --owns contract. Customized files/links stay.
 
 is_package_installed    pacman -Qi probe.
-is_webapp_installed     Checks ~/.local/share/applications/<name>.desktop.
-is_npm_cli_installed    Checks ~/.local/bin/<cmd> AND that it's a pnpm-dlx stub
-                        (greps "pnpm dlx") so unrelated user binaries are safe.
+is_webapp_installed     Checks a regular desktop file and its launcher command.
+is_npm_cli_installed    Checks a regular non-symlink wrapper against complete
+                        known templates and command/package mappings.
 get_installed_*         Filter each DEFAULT_* list down to what's installed.
 parse_sections          Splits a combined "items + --webapps-- + --npmclis--"
                         array into PARSED_PACKAGES/WEBAPPS/NPMCLIS globals. Used
@@ -42,41 +45,50 @@ parse_sections          Splits a combined "items + --webapps-- + --npmclis--"
 webapp_domains_for      Maps a webapp name -> URL domain(s) that identify it.
 app_tokens_for          Maps a package -> the token(s) its keybind references
                         (1password-beta -> 1password; docker* -> docker lazydocker).
-find_app_bindings       Finds keybinds that launch a given app/webapp, in BOTH
-                        the current Lua format (o.bind(..., { launch/tui/webapp }))
-                        and the legacy .conf format (bindd = ..., exec, ...).
-remove_bindings_from_file  Backs up $BINDINGS_FILE, then strips matched lines.
+find_bindings_in_file   Matches supported single-line Lua/conf bindings; can
+                        return line numbers so identical comment text survives.
+find_app_bindings       Matches the user's bindings file.
+find_packaged_unbind_keys  Matches packaged applications.lua, respecting global
+                        disable flags, the removal marker, and active unbinds.
+cleanup_bindings        Creates a checked, unique backup and atomic replacement;
+                        removes matched user lines and PREPENDS packaged unbinds
+                        so personal overrides on the same keys still work.
 
 enhanced_select_packages   The gum fuzzy multi-select. Items arrive in one array
                         split by "--webapps--"/"--npmclis--" sentinels; prefixed
                         📦/🌐/⬢ and marked ⌨ if they have a keybind. Sets globals
                         SELECTED_PACKAGES / SELECTED_WEBAPPS / SELECTED_NPMCLIS
                         (newline-delimited, to survive names with spaces).
-remove_webapps          Loops omarchy-webapp-remove with progress bar.
-remove_npm_clis         Deletes the ~/.local/bin stubs (no sudo) with progress bar.
-remove_packages         Acquires sudo, loops sudo pacman -Rns with progress bar.
-remove_items            parse_sections, then binding removal + all three removers,
-                        then prints the success / partial / failure hero box.
+remove_webapps          Removes one selected webapp/TUI launcher with its helper;
+                        shortcut-only selections require cleanup consent.
+remove_npm_clis         Rechecks ownership and deletes selected stubs (no sudo).
+remove_packages         Acquires sudo, removes selected packages in one transaction.
+remove_items            parse_sections, all three removers, then binding cleanup
+                        only for successful removals, followed by the hero box.
 main                    Banner → scan → select → keybind prompt → confirm → remove.
 ```
 
-There are no functions outside this file and no test suite — verification is by
-running the script (see Build & Run).
+Runtime code is self-contained in this file. Regression tests live in `tests/`
+and use disposable homes and stubbed system commands (see Build & Run).
 
 ## Design and Concepts
 
 ### What "Omarchy default" means
 
-The two lists are the heart of the tool and must track upstream Omarchy. The
+The catalogues are the heart of the tool and must track upstream Omarchy. The
 sources of truth, in the cloned Omarchy repo (`~/dev/omarchy`):
 
 - **`install/omarchy-base.packages`** — the canonical default package list.
-- **`install/packaging/webapps.sh`** — the default webapps (display names are the
-  first argument to `omarchy-webapp-install`).
+- **`applications/*.desktop`** — current webapp and TUI launchers.
+- **`install/user/mise.sh`** and **`bin/omarchy-mise-install`** — current CLI
+  names and wrapper contents. Also check `bin/omarchy-install-hermes-cli`.
+- **`default/hypr/bindings/applications.lua`** — packaged application bindings.
+- Legacy sources include `install/packaging/webapps.sh`,
+  `install/packaging/npx.sh`, and `bin/omarchy-npx-install`.
 - **`bin/omarchy-remove-preinstalls`** — Omarchy's *own* "remove the preinstalls"
   command. Its `omarchy-pkg-drop ...` list is the best signal for which packages
   Omarchy itself considers safely removable; keep `DEFAULT_APPS`' active entries
-  aligned with it. It also drops npm CLI stubs and all webapps/TUIs.
+  aligned with it. It also drops CLI stubs and all webapps/TUIs.
 
 `DEFAULT_APPS` keeps an *active* set (uncommented, the common "I don't want this"
 apps) plus a large *commented* catalogue of every remaining Omarchy default, so a
@@ -96,15 +108,16 @@ may still have them.
 ### Beyond Omarchy's own remover
 
 Omarchy ships `omarchy-remove-preinstalls`, but it is **all-or-nothing**: it wipes
-*every* webapp and TUI, replaces `bindings.lua` wholesale with `plain-bindings.lua`,
-and drops a fixed package set. Omarchy Cleaner deliberately goes further:
+*every* webapp and TUI, sets the `preinstalls-removed` state marker to disable
+all preinstalled app bindings, and drops a fixed package set. Omarchy Cleaner
+deliberately goes further:
 
 - **Selective** — fuzzy multi-select exactly which packages / webapps / npm CLIs
   to remove, nothing pre-selected.
 - **Surgical binding cleanup** — instead of replacing the whole bindings file, it
-  finds and strips only the keybinds belonging to the items being removed (with a
-  timestamped backup), and supports both the `.lua` and legacy `.conf` formats.
-- **Three categories in one pass** — pacman packages, webapps, and npm-CLI stubs.
+  strips only matching user bindings and prepends unbinds for packaged defaults
+  (with a timestamped backup), supporting Lua and legacy `.conf` formats.
+- **Three categories in one pass** — packages, webapp/TUI launchers, and CLI wrappers.
 
 Keep parity with Omarchy's drop list as a *floor*, not a ceiling: when syncing,
 make sure everything `omarchy-remove-preinstalls` removes is offered here too, then
@@ -114,16 +127,18 @@ keep the extra reach.
 
 The script runs unprivileged. Only `pacman -Rns` needs root, so `remove_packages`
 prompts for `sudo` once up front (`sudo -n true` check, then `sudo true`) and
-reuses the cached credential for the loop. Webapp removal, npm-stub deletion, and
+reuses the cached credential for one transaction containing all selected packages.
+Webapp/TUI removal, CLI-wrapper deletion, and
 binding edits are all in the user's `$HOME` and never touch root. Keep this split
 — do not run the whole script under sudo.
 
 ### Selection plumbing
 
-Packages, webapps, and npm CLIs travel together through one array, separated by
+Packages, desktop launchers, and CLI wrappers travel through one array, separated by
 the literal `--webapps--` and `--npmclis--` sentinels (always in that order),
-because Bash can't pass several arrays cleanly. `parse_sections` is the single
-place that splits them back out — use it rather than re-scanning for sentinels.
+because Bash can't pass several arrays cleanly. TUIs share the `--webapps--`
+section; its internal variable names are retained for compatibility.
+`parse_sections` is the single place that splits them back out — use it rather than re-scanning for sentinels.
 Selected results come back as **newline-delimited strings** (`SELECTED_PACKAGES` /
 `SELECTED_WEBAPPS` / `SELECTED_NPMCLIS`), not space-separated, specifically so
 webapp names with spaces ("Google Photos") survive. Preserve that when touching
@@ -136,7 +151,14 @@ If selected apps have Hyprland keybinds, the script offers to strip them from th
 user's bindings file (timestamped backup first). `BINDINGS_FILE` is auto-detected
 at startup: Omarchy migrated Hyprland config from `*.conf` to `*.lua`, so it
 prefers `~/.config/hypr/bindings.lua` and falls back to the legacy
-`bindings.conf`. `find_app_bindings` matches both formats:
+`bindings.conf`.
+
+On Quattro, defaults live under `$OMARCHY_PATH/default/hypr/bindings/` (falling
+back to `/usr/share/omarchy`), and the user file contains overrides. Prepend
+`hl.unbind("KEY")` before those overrides; appending would disable replacement
+shortcuts. Never edit packaged config or disable every preinstall binding.
+
+`find_app_bindings` matches both formats:
 
 - **Lua**: `o.bind("KEY", "Label", { launch/tui/omarchy = "app", ... })` and
   `{ webapp = "https://..." }`.
@@ -146,15 +168,19 @@ prefers `~/.config/hypr/bindings.lua` and falls back to the legacy
 Native apps are matched via `app_tokens_for` (handles `1password-*` → `1password`
 and `docker*` → `docker`/`lazydocker`); webapps via `webapp_domains_for` (the
 binding must invoke a webapp launcher *and* carry a URL on a matching domain).
-Removal is line-based, which is safe for both formats since each binding is one
-line. npm CLIs have no keybinds and are skipped.
+Removal uses matched line numbers and leaves multiline/computed Lua alone.
+Long comments and strings are skipped using their exact delimiters. Webapp URLs
+are matched by hostname, not substrings. CLI wrappers skip binding cleanup.
 
 ### Safety
 
 Removal is irreversible (`pacman -Rns` purges configs + unused deps), so there is
 a final itemised confirmation before anything is touched, nothing is selected by
-default, and bindings.conf is always backed up before edits. Preserve these
-guardrails.
+default, and existing bindings files are always backed up before edits. Abort
+binding edits if backup, write, or replacement fails; report partial success if
+removal succeeded but cleanup did not. Never clean shortcuts for failed removals.
+Pass removal targets as quoted arguments, never interpolated `bash -c` code.
+Preserve these guardrails.
 
 ## Build & Run
 
@@ -163,7 +189,8 @@ There is nothing to build. To exercise changes:
 ```bash
 bash -n omarchy-cleaner.sh        # syntax check (run this after every edit)
 shellcheck omarchy-cleaner.sh     # lint, if installed
-./omarchy-cleaner.sh              # run the real TUI (will offer to remove pkgs!)
+python3 -m unittest discover -s tests -v  # isolated regression checks
+./omarchy-cleaner.sh              # real TUI: use a disposable Omarchy VM
 ```
 
 When testing logic that would actually uninstall things, test on a throwaway
@@ -183,10 +210,11 @@ working machine.
   contain spaces.
 - When adding items, match Omarchy's own naming exactly: packages go in
   `DEFAULT_APPS` (active or commented) as they appear in `omarchy-base.packages`;
-  webapps go in `DEFAULT_WEBAPPS` by display name (first arg to
-  `omarchy-webapp-install`); npm CLIs go in `DEFAULT_NPM_CLIS` by command name
-  (second arg to `omarchy-npm-install`, defaulting to the package name). A webapp
-  that's added also needs a `webapp_domains_for` entry for binding cleanup to
+  webapps go in `DEFAULT_WEBAPPS` and TUIs in `DEFAULT_TUIS` by desktop basename.
+  CLI wrappers go in `DEFAULT_NPM_CLIS` by command name (second arg to
+  `omarchy-mise-install`, defaulting to the package name); update the explicit
+  mapping in `cli_packages_for` and verify the full upstream wrapper template.
+  A webapp that's added also needs a `webapp_domains_for` entry for binding cleanup to
   find it.
 
 ## Agent behaviour
@@ -195,7 +223,7 @@ working machine.
   messages. Keep messages concise: a clear subject line and a short body
   explaining the why when it isn't obvious.
 - Commit and push only when asked; otherwise leave the tree for the maintainer.
-- When syncing the app/webapp lists, re-read the three upstream sources above
+- When syncing the app/webapp lists, re-read the upstream sources above
   from the local Omarchy clone rather than trusting this file — Omarchy changes
-  its defaults frequently (packages get renamed, moved to npm, or dropped).
+  its defaults frequently (packages get renamed, moved to mise, or dropped).
 - After any edit, run `bash -n omarchy-cleaner.sh` before reporting done.
